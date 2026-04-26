@@ -47,6 +47,7 @@ sources = [
     'csrc/sm120_mqa_logits_fallback.cu',
     'csrc/sm120_hc_prenorm_fallback.cu',
     'csrc/sm120_sparse_mla_decode.cu',
+    'csrc/sm120_moe_activation_quant.cu',
 ]
 build_include_dirs = [
     f'{CUDA_HOME}/include',

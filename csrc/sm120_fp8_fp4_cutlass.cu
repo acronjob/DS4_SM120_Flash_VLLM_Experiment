@@ -607,6 +607,76 @@ __global__ void prepare_compact_grouped_kernel(
     }
 }
 
+__global__ void prepare_row_grouped_kernel(
+    const uint8_t* __restrict__ a, const void* __restrict__ sfa,
+    const int8_t* __restrict__ b, ElementD* __restrict__ d,
+    const int32_t* __restrict__ grouped_layout,
+    ElementInputA const** __restrict__ ptr_a,
+    ElementInputB const** __restrict__ ptr_b,
+    ElementSF const** __restrict__ ptr_sfa,
+    ElementSF const** __restrict__ ptr_sfb,
+    ElementD** __restrict__ ptr_d,
+    StrideA* __restrict__ stride_a,
+    StrideB* __restrict__ stride_b,
+    StrideD* __restrict__ stride_d,
+    LayoutSFA* __restrict__ layout_sfa,
+    LayoutSFB* __restrict__ layout_sfb,
+    typename ProblemShape::UnderlyingProblemShape* __restrict__ problems,
+    ElementSF* __restrict__ sfa_ue8,
+    const ElementSF* __restrict__ sfb_ue8,
+    int m, int n, int k, int k32, int sfa_kind, int sfb_layout_m,
+    size_t sfa_group_elems, size_t sfb_group_elems,
+    int64_t a_s0, int64_t a_s1, int64_t sfa_s0, int64_t sfa_s1,
+    int64_t b_s0, int64_t d_s0, int64_t d_s1) {
+    const int row = blockIdx.x;
+    if (row >= m)
+        return;
+
+    const int group = grouped_layout[row];
+    ElementSF* row_sfa = sfa_ue8 + static_cast<size_t>(row) * sfa_group_elems;
+    const auto row_layout_sfa =
+        MxScaleConfig::tile_atom_to_shape_SFA(make_shape(1, n, k, 1));
+
+    if (group >= 0) {
+        for (int kk32 = threadIdx.x; kk32 < k32; kk32 += blockDim.x) {
+            const auto out_idx = row_layout_sfa(0, kk32 * 32, 0);
+            if (sfa_kind == 0) {
+                const auto* sfa_f32 = static_cast<const float*>(sfa);
+                row_sfa[out_idx] =
+                    to_ue8m0(sfa_f32[row * sfa_s0 + (kk32 / 4) * sfa_s1]);
+            } else {
+                const auto* sfa_i32 = static_cast<const int32_t*>(sfa);
+                const int kk128 = kk32 / 4;
+                const int32_t packed =
+                    sfa_i32[row * sfa_s0 + (kk128 / 4) * sfa_s1];
+                reinterpret_cast<uint8_t*>(row_sfa)[out_idx] =
+                    static_cast<uint8_t>((packed >> ((kk128 & 3) * 8)) & 0xff);
+            }
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        const int rows = group >= 0 ? 1 : 0;
+        problems[row] = make_shape(rows, n, k);
+        ptr_a[row] = reinterpret_cast<ElementInputA const*>(a + row * a_s0);
+        ptr_b[row] = reinterpret_cast<ElementInputB const*>(
+            b + static_cast<int64_t>(max(group, 0)) * b_s0);
+        ptr_sfa[row] = row_sfa;
+        ptr_sfb[row] =
+            sfb_ue8 + static_cast<size_t>(max(group, 0)) * sfb_group_elems;
+        ptr_d[row] = d + row * d_s0;
+        stride_a[row] =
+            cutlass::make_cute_packed_stride(StrideA{}, make_shape(rows, k, 1));
+        stride_b[row] =
+            cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
+        stride_d[row] =
+            cutlass::make_cute_packed_stride(StrideD{}, make_shape(rows, n, 1));
+        layout_sfa[row] = row_layout_sfa;
+        layout_sfb[row] = MxScaleConfig::tile_atom_to_shape_SFB(
+            make_shape(sfb_layout_m > 0 ? sfb_layout_m : rows, n, k, 1));
+    }
+}
+
 StaticScale get_or_create_sfb(const torch::Tensor& sfb, int num_groups, int n, int k32,
                               int m, int k, size_t sfb_group_elems, cudaStream_t stream) {
     const int device = sfb.get_device();
@@ -719,6 +789,11 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
     const size_t sfa_total_elems = static_cast<size_t>(num_groups) * sfa_group_elems;
     const size_t sfb_group_elems = static_cast<size_t>(size(filter_zeros(max_layout_sfb)));
     const auto stream = at::cuda::getCurrentCUDAStream();
+    const int row_grouped_max_m =
+        env_int_or_default("DG_SM120_MOE_ROW_GROUPED_MAX_M", 16);
+    const bool row_grouped =
+        compact_active_groups && env_flag_enabled("DG_SM120_MOE_ROW_GROUPED") &&
+        (row_grouped_max_m < 0 || m <= row_grouped_max_m);
     static sm120_profile::KernelProfileCounter profile_counter(
         "sm120_moe_fp8_fp4_cutlass");
     sm120_profile::ScopedTimer profile_timer(
@@ -755,22 +830,47 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
 
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {gemm_num_groups, nullptr, nullptr},
+        {row_grouped ? m : gemm_num_groups, nullptr, nullptr},
         {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr},
         {{}, nullptr, nullptr, nullptr, nullptr},
         hw_info,
         scheduler};
 
     const size_t workspace_size = Gemm::get_workspace_size(arguments);
-    Scratch& scratch = get_scratch(device, num_groups,
+    Scratch& scratch = get_scratch(device, row_grouped ? m : num_groups,
                                    sizeof(ElementSF) *
-                                       (compact_active_groups
+                                       (row_grouped
+                                            ? static_cast<size_t>(m) *
+                                                  sfa_group_elems
+                                        : compact_active_groups
                                             ? static_cast<size_t>(gemm_num_groups) *
                                                   sfa_group_elems
                                             : sfa_total_elems),
                                    workspace_size);
 
-    if (compact_active_groups) {
+    if (row_grouped) {
+        const size_t row_sfa_total = static_cast<size_t>(m) * sfa_group_elems;
+        const bool skip_row_sfa_fill =
+            sfa_kind == 1 && env_flag_enabled("DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL");
+        if (!skip_row_sfa_fill) {
+            fill_scale_kernel<<<static_cast<unsigned>((row_sfa_total + 255) / 256), 256, 0, stream>>>(
+                scratch.sfa_ue8, row_sfa_total);
+            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        }
+
+        prepare_row_grouped_kernel<<<m, 256, 0, stream>>>(
+            reinterpret_cast<const uint8_t*>(a.data_ptr()), sfa.data_ptr(),
+            b.data_ptr<int8_t>(), reinterpret_cast<ElementD*>(d.data_ptr()),
+            grouped_layout.data_ptr<int32_t>(), scratch.ptr_a, scratch.ptr_b,
+            scratch.ptr_sfa, scratch.ptr_sfb, scratch.ptr_d, scratch.stride_a,
+            scratch.stride_b, scratch.stride_d, scratch.layout_sfa,
+            scratch.layout_sfb, scratch.problems, scratch.sfa_ue8,
+            sfb_ue8.data, m, n, k, k32, sfa_kind, sfb_layout_m,
+            sfa_group_elems, sfb_group_elems, a.stride(0), a.stride(1),
+            sfa.stride(0), sfa.stride(1), b.stride(0), d.stride(0),
+            d.stride(1));
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    } else if (compact_active_groups) {
         const size_t compact_sfa_total =
             static_cast<size_t>(gemm_num_groups) * sfa_group_elems;
         const int skip_fill_max_m =

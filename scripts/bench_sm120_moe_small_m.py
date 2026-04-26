@@ -53,10 +53,17 @@ def call_kernel(case, out):
 def set_mode(mode: str) -> None:
     os.environ.pop("DG_SM120_ENABLE_SMALL_M_MMA", None)
     os.environ.pop("DG_SM120_MOE_SKIP_SFA_FILL", None)
+    os.environ.pop("DG_SM120_MOE_ROW_GROUPED", None)
+    os.environ.pop("DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL", None)
     if mode == "small_m":
         os.environ["DG_SM120_ENABLE_SMALL_M_MMA"] = "1"
     elif mode == "skip_fill":
         os.environ["DG_SM120_MOE_SKIP_SFA_FILL"] = "1"
+    elif mode == "row_grouped":
+        os.environ["DG_SM120_MOE_ROW_GROUPED"] = "1"
+    elif mode == "row_grouped_skip_fill":
+        os.environ["DG_SM120_MOE_ROW_GROUPED"] = "1"
+        os.environ["DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL"] = "1"
 
 
 def bench(case, out, mode: str, warmup: int, iters: int) -> float:
@@ -85,8 +92,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--modes",
-        default="default,skip_fill,small_m",
-        help="Comma-separated modes: default, skip_fill, small_m",
+        default="default,skip_fill,small_m,row_grouped,row_grouped_skip_fill",
+        help="Comma-separated modes: default, skip_fill, small_m, row_grouped, row_grouped_skip_fill",
     )
     args = parser.parse_args()
 

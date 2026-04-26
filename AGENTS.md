@@ -37,6 +37,9 @@ Blackwell workstation GPUs, which report compute capability SM120.
 - `DG_SM120_PREFILL_WORKSPACE_CHUNK=16`
 - `DG_SM120_MOE_SKIP_SFA_FILL=1`
 - `DG_SM120_MOE_SKIP_SFA_FILL_MAX_M=16`
+- `DG_SM120_MOE_ROW_GROUPED=1`
+- `DG_SM120_MOE_ROW_GROUPED_MAX_M=16`
+- `DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL=1`
 - `DG_SM120_BYPASS_TP_ALLREDUCE=0`
 - `DG_SM120_MHC_REUSE_BUFFERS=0`
 
@@ -98,6 +101,12 @@ Important implemented paths:
   `DG_SM120_MOE_SKIP_SFA_FILL=1` skips compact SFA fill only for
   `m <= DG_SM120_MOE_SKIP_SFA_FILL_MAX_M` by default. This keeps the small-M
   decode microbench win without hurting larger batched shapes.
+- SM120 CUTLASS MoE row-grouped compact setup is enabled for low-M decode:
+  `DG_SM120_MOE_ROW_GROUPED=1` uses one grouped-CUTLASS problem per routed row
+  for `m <= DG_SM120_MOE_ROW_GROUPED_MAX_M`.
+  `DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL=1` skips the row-group scale fill for
+  packed UE8M0 activation scales. This is bit-exact in the tested packed-scale
+  path and removes two setup launches from the tiny-M decode path.
 - SM120 sparse MLA prefill from BF16 workspace:
   - exported as `deep_gemm._C.sm120_sparse_mla_prefill_from_bf16_workspace`
   - validated synthetically for BF16 tolerance
@@ -118,8 +127,8 @@ Useful scripts include:
 - `scripts/bench_sm120_fp8_bhr_hdr_bhd.py`
 - `scripts/bench_sm120_fp8_m1.py`
 - `scripts/bench_sm120_fp8_projection_shapes.py`
-- `scripts/bench_sm120_mhc.py`
 - `scripts/bench_sm120_moe_small_m.py`
+- `scripts/bench_sm120_mhc.py`
 - `scripts/bench_sm120_workspace_attention.py`
 
 ## What Worked
@@ -262,6 +271,20 @@ The second likely bottleneck is sparse MLA decode and MoE decode efficiency.
 The current implementation still contains fallback/workspace-heavy paths that
 are functional but not production-grade.
 
+For the measured single-request decode path, the dominant remaining MoE target
+is the tiny-M SM120 FP8xFP4 routed expert GEMM body. The setup overhead has
+been reduced and bounded:
+
+- `row_grouped_skip_fill` removes the compact init/fill setup launches for
+  `m <= 16` and is bit-exact against the default CUTLASS path in synthetic
+  tests.
+- CUDA profiling on `m=6,n=4096,k=2048` shows the row-grouped path spends about
+  `344.981 us` of `356.500 us` total CUDA time over 10 calls in the CUTLASS
+  device kernel itself. The row setup kernel is about `11.519 us` over 10 calls.
+- This means another helper/setup kernel tweak cannot plausibly produce the
+  missing 2x. Meaningful decode improvement needs a better tiny-M expert GEMM
+  work decomposition or a more persistent/fused MoE layer kernel.
+
 ## Recent Delta Since Last Commit
 
 - Added the SM120 no-Q-padding vLLM patch. This removes one per-layer padding
@@ -273,8 +296,41 @@ are functional but not production-grade.
 - Extended the BHR warp-column heuristic to short decode shapes.
 - Changed MoE compact SFA-fill skipping to be gated by
   `DG_SM120_MOE_SKIP_SFA_FILL_MAX_M`.
+- Added SM120 MoE row-grouped compact setup for low-M decode, gated by
+  `DG_SM120_MOE_ROW_GROUPED` and `DG_SM120_MOE_ROW_GROUPED_MAX_M`.
+- Added `DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL` for packed UE8M0 activation
+  scales. In synthetic tests it is bit-exact and improves low-M setup overhead.
+- Added `row_grouped` and `row_grouped_skip_fill` modes to
+  `scripts/bench_sm120_moe_small_m.py`.
+- Tested but rejected several MoE ideas:
+  - CUTLASS `N=64` tile shape failed to compile because the SM120 blockscaled
+    scale-factor TMA layout requires 128-wide compatible tiles.
+  - CUTLASS `N=256` tile shape failed because auto pipeline stage count dropped
+    below the required minimum.
+  - CUTLASS cooperative grouped schedule compiled but regressed key shapes
+    versus ping-pong.
+  - the existing hand-written `DG_SM120_ENABLE_SMALL_M_MMA` path remains slower
+    than CUTLASS for relevant shapes.
+  - a CUDA-core skinny dot-product prototype was correct but slower for
+    realistic `m=6` shapes and was removed.
 - Added `VLLM_PROFILER_CONFIG_JSON` compose plumbing for quoted profiler config.
   This was added after an unquoted profiler restart broke startup.
+
+Latest MoE microbench results from one-off CUDA 13 container rebuilds:
+
+- `m=6,n=4096,k=2048`: default `41.130 us`,
+  `row_grouped_skip_fill` `37.175 us`, bit-exact, `1.106x`.
+- `m=6,n=4096,k=4096`: default about `71.778 us`,
+  `row_grouped_skip_fill` about `64.679 us`, bit-exact, `1.110x`.
+- `m=6,n=7168,k=2048`: default `61.379-61.536 us`,
+  `row_grouped_skip_fill` `57.002-57.100 us`, bit-exact, about `1.08x`.
+- `m=6,n=7168,k=4096`: default `96.052 us`,
+  `row_grouped_skip_fill` `84.007 us`, bit-exact, `1.143x`.
+- `m=6,n=4096,k=7168`: default `117.970 us`,
+  `row_grouped_skip_fill` `116.479 us`, bit-exact, only `1.013x`.
+- `m=24,n=4096,k=2048`: default `99.072 us`,
+  `row_grouped_skip_fill` `100.077 us`, bit-exact, slight regression. Keep the
+  max-M guard enabled.
 
 ## Next Work
 
@@ -297,8 +353,10 @@ are functional but not production-grade.
    `VLLM_EXTRA_ARGS` so JSON is passed as one argument.
 
 5. Revisit the C128 decode/MoE path after prefill is fixed.
-   The C128 projection microbench improved, but end-to-end did not. The
-   remaining runtime is likely elsewhere.
+   The C128 projection microbench improved, but end-to-end did not. For MoE
+   decode, setup overhead is now small enough that the next useful work is a
+   production tiny-M FP8xFP4 expert GEMM or persistent/fused MoE layer, not more
+   helper-kernel cleanup.
 
 6. Audit all remaining fallback paths.
    Files with `fallback` in the name are functional scaffolding, not proof that

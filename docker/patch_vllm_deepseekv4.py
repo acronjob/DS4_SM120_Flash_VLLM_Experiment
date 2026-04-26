@@ -3012,6 +3012,86 @@ def patch_deep_gemm_moe_with_starts() -> None:
     path.write_text(source)
 
 
+def patch_deep_gemm_moe_fused_activation_quant() -> None:
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "layers/fused_moe/experts/deep_gemm_moe.py"
+    )
+    source = path.read_text()
+    if "import deep_gemm\n" not in source:
+        source = source.replace("import torch\n", "import torch\nimport deep_gemm\n", 1)
+
+    marker = 'deep_gemm._C.sm120_silu_mul_quant_fp8_packed'
+    if marker not in source:
+        old_two_step = """        # 1. DeepGemm UE8M0: use packed per-token-group quant
+        if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
+            act_out = torch.empty(
+                (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
+            )
+            self.activation(activation, act_out, input)
+            a2q, a2q_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+                act_out,
+                block_k,
+                out_q=output,
+            )
+            return a2q, a2q_scale
+"""
+        old_triton_fused = """        # 1. DeepGemm UE8M0: fused SiLU+mul+clamp+quant+pack
+        if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
+            if activation == MoEActivation.SILU:
+                return fused_silu_mul_fp8_quant_packed(
+                    input=input,
+                    output_q=output,
+                    group_size=block_k,
+                )
+            act_out = torch.empty(
+                (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
+            )
+            self.activation(activation, act_out, input)
+            a2q, a2q_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+                act_out,
+                block_k,
+                out_q=output,
+            )
+            return a2q, a2q_scale
+"""
+        new = """        # 1. DeepGemm UE8M0: fuse SiLU+mul and packed scale quantization on SM120.
+        if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
+            if (
+                activation == MoEActivation.SILU
+                and input.is_cuda
+                and input.is_contiguous()
+                and output.is_contiguous()
+                and input.dtype == torch.bfloat16
+                and output.dtype == torch.float8_e4m3fn
+                and torch.cuda.get_device_capability(input.device)[0] >= 12
+                and hasattr(deep_gemm._C, "sm120_silu_mul_quant_fp8_packed")
+            ):
+                a2q_scale = deep_gemm._C.sm120_silu_mul_quant_fp8_packed(
+                    input, output, block_k
+                )
+                return output.view(M_sum, activation_out_dim), a2q_scale
+
+            act_out = torch.empty(
+                (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
+            )
+            self.activation(activation, act_out, input)
+            a2q, a2q_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+                act_out,
+                block_k,
+                out_q=output,
+            )
+            return a2q, a2q_scale
+"""
+        if old_triton_fused in source:
+            source = source.replace(old_triton_fused, new, 1)
+        elif old_two_step in source:
+            source = source.replace(old_two_step, new, 1)
+        else:
+            raise RuntimeError(f"Could not patch SM120 fused act+quant in {path}")
+    path.write_text(source)
+
+
 patch_cuda_platform_deep_gemm_sm120()
 patch_triton_mxfp4_sm120()
 patch_deep_gemm_fp4_sm120()
@@ -3022,6 +3102,7 @@ patch_block_scaled_mm()
 patch_deep_gemm_wrapper_with_starts()
 patch_deep_gemm_moe_permute_starts()
 patch_deep_gemm_moe_with_starts()
+patch_deep_gemm_moe_fused_activation_quant()
 patch_sm120_b12x_deep_gemm_moe()
 patch_deepseek_v4_attention()
 patch_flashmla_sparse_decode()
