@@ -168,6 +168,28 @@ __host__ __forceinline__ bool sm120_score_mma_scalar_check() {
     return enabled;
 }
 
+// Split-K SCORE MMA — sibling of SCORE_MMA tuned for SM_120 parallelism on
+// the production active_heads=32, topk≤128 shape. The non-split kernel
+// produces a (≤4, 2, batch) grid that under-fills 188 SMs; this variant uses
+// (slots/8, batch, splitk=4) → ~512 blocks at B=8, slots=128.
+__host__ __forceinline__ bool sm120_score_mma_splitk_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DG_SM120_SCORE_MMA_SPLITK");
+        if (env == nullptr || env[0] == '\0') return false;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
+__host__ __forceinline__ bool sm120_score_mma_splitk_scalar_check() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DG_SM120_SCORE_MMA_SPLITK_SCALAR_CHECK");
+        if (env == nullptr || env[0] == '\0') return false;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
 template <typename T>
 __device__ __forceinline__ float load_q_value(const T* q, int64_t offset) {
     return static_cast<float>(q[offset]);
@@ -1681,6 +1703,238 @@ __global__ void sparse_mla_workspace_score_mma_kernel(
     write_score(h1, j1, d3);
 }
 
+// ===== Split-K SCORE MMA =================================================
+// Layout (production active_heads=32, candidate_slots≤128):
+//   block tile  : M=32 (all active heads), N=8 (one slot N-tile), K-window
+//                 = kHeadDim / kSplit = 128 (out of 512).
+//   block grid  : (ceil(slots/8), batch, kSplit) — at slots=128, B=8,
+//                 kSplit=4 → 16 × 8 × 4 = 512 blocks vs 188 SMs.
+//   warps/block : 2  (warp 0 → M[0..15], warp 1 → M[16..31]).
+//   smem        : (M+N) * Kchunk * 2B = 5 KB; trivially fits with high
+//                 occupancy.
+// Each block streams its assigned K-window (128 elements) in two 64-elem
+// chunks, accumulates float, and writes a partial to
+//   partials[kSplit, batch, head, slot]
+// A second tiny reduce kernel sums partials → final scores with the
+// validity mask + softmax_scale.
+constexpr int kScoreMmaSpkM = 32;
+constexpr int kScoreMmaSpkN = 8;
+constexpr int kScoreMmaSpkK = 16;
+constexpr int kScoreMmaSpkKChunk = 64;
+constexpr int kScoreMmaSpkSplit = 4;
+constexpr int kScoreMmaSpkKPerBlock = kHeadDim / kScoreMmaSpkSplit;
+constexpr int kScoreMmaSpkChunksPerBlock =
+    kScoreMmaSpkKPerBlock / kScoreMmaSpkKChunk;
+constexpr int kScoreMmaSpkNumWarps = kScoreMmaSpkM / 16;
+constexpr int kScoreMmaSpkThreads = 32 * kScoreMmaSpkNumWarps;
+constexpr size_t kScoreMmaSpkSmemBytes =
+    static_cast<size_t>(kScoreMmaSpkM + kScoreMmaSpkN) * kScoreMmaSpkKChunk *
+    sizeof(__nv_bfloat16);
+
+template <typename q_t, typename kv_t, bool kScalarCheck>
+__global__ void sparse_mla_workspace_score_mma_splitk_kernel(
+    const q_t* __restrict__ q, const kv_t* __restrict__ kv_workspace,
+    float* __restrict__ partials, int batch_size, int active_heads,
+    int num_heads, int candidate_slots, int64_t q_stride_b,
+    int64_t q_stride_h, int64_t q_stride_d, int64_t kv_stride_b,
+    int64_t kv_stride_s, int64_t kv_stride_d) {
+    const int n_tile = blockIdx.x;
+    const int b = blockIdx.y;
+    const int sk = blockIdx.z;
+    const int n_base = n_tile * kScoreMmaSpkN;
+    const int sk_k_base = sk * kScoreMmaSpkKPerBlock;
+    if (b >= batch_size || n_base >= candidate_slots) return;
+
+    extern __shared__ __nv_bfloat16 score_mma_spk_smem[];
+    __nv_bfloat16* q_smem = score_mma_spk_smem;
+    __nv_bfloat16* kv_smem = q_smem + kScoreMmaSpkM * kScoreMmaSpkKChunk;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int groupID = lane >> 2;
+    const int tid_in_group = lane & 3;
+
+    const int m_warp_base = warp_id * 16;  // 0 or 16
+    const int64_t q_b_base = static_cast<int64_t>(b) * q_stride_b;
+    const int64_t kv_b_base = static_cast<int64_t>(b) * kv_stride_b;
+
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+
+    #pragma unroll
+    for (int chunk = 0; chunk < kScoreMmaSpkChunksPerBlock; ++chunk) {
+        const int k_off = sk_k_base + chunk * kScoreMmaSpkKChunk;
+
+        // Cooperative load Q[h_base + m, k_off + kk] -> q_smem[m, kk].
+        // 64 threads × 32 elements = 2048 bf16 = M*Kchunk.
+        for (int idx = tid; idx < kScoreMmaSpkM * kScoreMmaSpkKChunk;
+             idx += kScoreMmaSpkThreads) {
+            const int m = idx / kScoreMmaSpkKChunk;
+            const int kk = idx - m * kScoreMmaSpkKChunk;
+            float v = 0.f;
+            if (m < active_heads && m < num_heads) {
+                const int64_t off = q_b_base +
+                                    static_cast<int64_t>(m) * q_stride_h +
+                                    static_cast<int64_t>(k_off + kk) *
+                                        q_stride_d;
+                v = load_q_value<q_t>(q, off);
+            }
+            q_smem[m * kScoreMmaSpkKChunk + kk] = __float2bfloat16_rn(v);
+        }
+
+        // Cooperative load KV[n_base + n, k_off + kk] -> kv_smem[n, kk].
+        // 64 threads × 8 elements = 512 bf16 = N*Kchunk.
+        for (int idx = tid; idx < kScoreMmaSpkN * kScoreMmaSpkKChunk;
+             idx += kScoreMmaSpkThreads) {
+            const int n = idx / kScoreMmaSpkKChunk;
+            const int kk = idx - n * kScoreMmaSpkKChunk;
+            const int j = n_base + n;
+            float v = 0.f;
+            if (j < candidate_slots) {
+                const int64_t off = kv_b_base +
+                                    static_cast<int64_t>(j) * kv_stride_s +
+                                    static_cast<int64_t>(k_off + kk) *
+                                        kv_stride_d;
+                v = load_workspace_value<kv_t>(kv_workspace, off);
+            }
+            kv_smem[n * kScoreMmaSpkKChunk + kk] = __float2bfloat16_rn(v);
+        }
+        __syncthreads();
+
+        // 4 inner MMA steps per chunk (Kchunk=64 / Kmma=16 = 4).
+        // Each warp owns its M=16 sub-tile (warp 0 → M[0..15], warp 1 → [16..31]).
+        #pragma unroll
+        for (int kc = 0; kc < kScoreMmaSpkKChunk; kc += kScoreMmaSpkK) {
+            const int a_col_base = 2 * tid_in_group;
+            const __nv_bfloat16* a_row0_ptr =
+                q_smem + (m_warp_base + groupID) * kScoreMmaSpkKChunk + kc;
+            const __nv_bfloat16* a_row1_ptr =
+                q_smem + (m_warp_base + groupID + 8) * kScoreMmaSpkKChunk + kc;
+            // B fragment (N=8, K=16), .col PTX layout — kv_smem stores [n][k]
+            // row-major which is exactly B^T in (n,k) order.
+            const __nv_bfloat16* b_row_ptr =
+                kv_smem + groupID * kScoreMmaSpkKChunk + kc;
+
+            const uint32_t a0 = *reinterpret_cast<const uint32_t*>(
+                a_row0_ptr + a_col_base);
+            const uint32_t a1 = *reinterpret_cast<const uint32_t*>(
+                a_row1_ptr + a_col_base);
+            const uint32_t a2 = *reinterpret_cast<const uint32_t*>(
+                a_row0_ptr + a_col_base + 8);
+            const uint32_t a3 = *reinterpret_cast<const uint32_t*>(
+                a_row1_ptr + a_col_base + 8);
+            const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+                b_row_ptr + a_col_base);
+            const uint32_t b1 = *reinterpret_cast<const uint32_t*>(
+                b_row_ptr + a_col_base + 8);
+
+            if constexpr (kScalarCheck) {
+                const int row0 = m_warp_base + groupID;
+                const int row1 = m_warp_base + groupID + 8;
+                const int col0 = 2 * tid_in_group;
+                const int col1 = col0 + 1;
+                float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+                #pragma unroll
+                for (int kk = 0; kk < kScoreMmaSpkK; ++kk) {
+                    const float ar0 = __bfloat162float(
+                        q_smem[row0 * kScoreMmaSpkKChunk + kc + kk]);
+                    const float ar1 = __bfloat162float(
+                        q_smem[row1 * kScoreMmaSpkKChunk + kc + kk]);
+                    const float bn0 = __bfloat162float(
+                        kv_smem[col0 * kScoreMmaSpkKChunk + kc + kk]);
+                    const float bn1 = __bfloat162float(
+                        kv_smem[col1 * kScoreMmaSpkKChunk + kc + kk]);
+                    acc0 += ar0 * bn0;
+                    acc1 += ar0 * bn1;
+                    acc2 += ar1 * bn0;
+                    acc3 += ar1 * bn1;
+                }
+                d0 += acc0;
+                d1 += acc1;
+                d2 += acc2;
+                d3 += acc3;
+                (void)a0; (void)a1; (void)a2; (void)a3;
+                (void)b0; (void)b1;
+            } else {
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0, %1, %2, %3}, "
+                    "{%4, %5, %6, %7}, "
+                    "{%8, %9}, "
+                    "{%0, %1, %2, %3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                      "r"(b0), "r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write partial (no scaling, no validity masking — reduce kernel handles).
+    // partials layout: [kSplit, batch, active_heads, candidate_slots].
+    auto write_partial = [&](int h, int j, float val) {
+        if (h >= active_heads || j >= candidate_slots) return;
+        const int64_t off =
+            ((static_cast<int64_t>(sk) * batch_size + b) * active_heads + h) *
+                candidate_slots +
+            j;
+        partials[off] = val;
+    };
+
+    const int h0 = m_warp_base + groupID;
+    const int h1 = m_warp_base + groupID + 8;
+    const int j0 = n_base + 2 * tid_in_group;
+    const int j1 = j0 + 1;
+    write_partial(h0, j0, d0);
+    write_partial(h0, j1, d1);
+    write_partial(h1, j0, d2);
+    write_partial(h1, j1, d3);
+}
+
+// Reduce partials[kSplit, B, H, S] → scores[B, H, S] with validity mask
+// and softmax_scale. Bandwidth-bound; one float load per split per cell.
+__global__ void sparse_mla_workspace_score_mma_splitk_reduce_kernel(
+    const float* __restrict__ partials,
+    const void* __restrict__ topk_length,
+    const void* __restrict__ extra_topk_length, float* __restrict__ scores,
+    int batch_size, int active_heads, int main_topk, int extra_topk,
+    int candidate_slots, int topk_length_kind, int extra_topk_length_kind,
+    float softmax_scale) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+    if (j >= candidate_slots) return;
+    if (h >= active_heads || b >= batch_size) return;
+
+    const int main_limit = max(
+        0, min(main_topk,
+               load_length_value(topk_length, topk_length_kind, b, main_topk)));
+    const int extra_limit = max(
+        0, min(extra_topk,
+               load_length_value(extra_topk_length, extra_topk_length_kind, b,
+                                 extra_topk)));
+    const bool valid =
+        j < main_limit || (j >= main_topk && j < main_topk + extra_limit);
+
+    const int64_t out_off =
+        (static_cast<int64_t>(b) * active_heads + h) * candidate_slots + j;
+    if (!valid) {
+        scores[out_off] = -INFINITY;
+        return;
+    }
+
+    float sum = 0.f;
+    #pragma unroll
+    for (int sk = 0; sk < kScoreMmaSpkSplit; ++sk) {
+        const int64_t in_off =
+            ((static_cast<int64_t>(sk) * batch_size + b) * active_heads + h) *
+                candidate_slots +
+            j;
+        sum += partials[in_off];
+    }
+    scores[out_off] = sum * softmax_scale;
+}
+
 template <typename kv_t, typename out_t>
 __global__ void sparse_mla_workspace_output_kernel(
     const kv_t* __restrict__ kv_workspace, const void* __restrict__ topk_length,
@@ -2724,7 +2978,55 @@ void launch_sparse_mla_decode_from_workspace_split(
     bool used_mma_score = false;
     if constexpr (std::is_same_v<q_t, __nv_bfloat16> &&
                   std::is_same_v<kv_t, __nv_bfloat16>) {
-        if (fast_path && sm120_score_mma_enabled()) {
+        // Split-K SCORE MMA — preferred when active_heads fits the M=32 tile.
+        if (fast_path && sm120_score_mma_splitk_enabled() &&
+            active_heads <= kScoreMmaSpkM) {
+            auto partials = torch::empty(
+                {kScoreMmaSpkSplit, batch_size, active_heads, candidate_slots},
+                q.options().dtype(torch::kFloat32));
+            const dim3 spk_grid(
+                (candidate_slots + kScoreMmaSpkN - 1) / kScoreMmaSpkN,
+                batch_size, kScoreMmaSpkSplit);
+            const bool scalar_check = sm120_score_mma_splitk_scalar_check();
+            if (scalar_check) {
+                sparse_mla_workspace_score_mma_splitk_kernel<q_t, kv_t, true>
+                    <<<spk_grid, kScoreMmaSpkThreads, kScoreMmaSpkSmemBytes,
+                       stream>>>(
+                        reinterpret_cast<const q_t*>(q.data_ptr()),
+                        reinterpret_cast<const kv_t*>(kv_workspace.data_ptr()),
+                        partials.data_ptr<float>(), batch_size, active_heads,
+                        num_heads, candidate_slots, q.stride(0), q.stride(2),
+                        q.stride(3), kv_workspace.stride(0),
+                        kv_workspace.stride(1), kv_workspace.stride(2));
+            } else {
+                sparse_mla_workspace_score_mma_splitk_kernel<q_t, kv_t, false>
+                    <<<spk_grid, kScoreMmaSpkThreads, kScoreMmaSpkSmemBytes,
+                       stream>>>(
+                        reinterpret_cast<const q_t*>(q.data_ptr()),
+                        reinterpret_cast<const kv_t*>(kv_workspace.data_ptr()),
+                        partials.data_ptr<float>(), batch_size, active_heads,
+                        num_heads, candidate_slots, q.stride(0), q.stride(2),
+                        q.stride(3), kv_workspace.stride(0),
+                        kv_workspace.stride(1), kv_workspace.stride(2));
+            }
+            const int reduce_block = 128;
+            const dim3 reduce_grid(
+                (candidate_slots + reduce_block - 1) / reduce_block,
+                active_heads, batch_size);
+            sparse_mla_workspace_score_mma_splitk_reduce_kernel
+                <<<reduce_grid, reduce_block, 0, stream>>>(
+                    partials.data_ptr<float>(),
+                    topk_length.defined() ? topk_length.data_ptr() : nullptr,
+                    extra_topk_length.defined()
+                        ? extra_topk_length.data_ptr()
+                        : nullptr,
+                    scores.data_ptr<float>(), batch_size, active_heads,
+                    main_topk, extra_topk, candidate_slots,
+                    length_tensor_kind(topk_length),
+                    length_tensor_kind(extra_topk_length),
+                    static_cast<float>(softmax_scale));
+            used_mma_score = true;
+        } else if (fast_path && sm120_score_mma_enabled()) {
             const dim3 mma_grid(
                 (candidate_slots + kScoreMmaN - 1) / kScoreMmaN,
                 (active_heads + kScoreMmaM - 1) / kScoreMmaM, batch_size);
