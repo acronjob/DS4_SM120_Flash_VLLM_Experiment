@@ -26,3 +26,7 @@ deep_gemm/*.so
 venv/
 DeepGEMM/
 extracted/
+
+# Parity / bench scratch (regenerable from scripts/)
+scripts/_parity_*.pt
+tmp/
