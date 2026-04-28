@@ -31,6 +31,19 @@ __host__ __forceinline__ bool sm120_hc_prenorm_mma_scalar_check() {
     return enabled;
 }
 
+// 2xTF32 emulation: split each f32 B value into a hi-tf32 + lo-tf32 residual
+// pair, run two mma.sync calls per K-step, sum into the same f32 accumulator.
+// Recovers ~20 bits of effective mantissa precision (vs 10 from single tf32),
+// which is enough to keep argmax stable on tight-margin softmax outputs.
+__host__ __forceinline__ bool sm120_hc_prenorm_mma_2xtf32() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DG_SM120_HC_PRENORM_MMA_2XTF32");
+        if (env == nullptr || env[0] == '\0') return false;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
 namespace sm120_fallback {
 
 __device__ __forceinline__ int split_k_begin(int k, int num_splits,
@@ -233,7 +246,7 @@ __device__ __forceinline__ uint32_t round_to_tf32_bits_dev(float v) {
     return b;
 }
 
-template <bool kScalarCheck>
+template <bool kScalarCheck, bool kEnable2xTF32>
 __global__ void hc_prenorm_block_reduce_mma_kernel(
     const __nv_bfloat16* __restrict__ a, const float* __restrict__ b,
     float* __restrict__ d, float* __restrict__ sqr_sum,
@@ -255,8 +268,10 @@ __global__ void hc_prenorm_block_reduce_mma_kernel(
     const int k_end = split_k_end(k, num_splits, split_idx);
 
     extern __shared__ float smem_buf[];
-    float* a_smem = smem_buf;                              // [kMmaM, kKChunk]
-    float* b_smem = a_smem + kMmaM * kKChunk;              // [n,     kKChunk]
+    float* a_smem    = smem_buf;                              // [kMmaM, kKChunk]
+    float* b_smem_hi = a_smem + kMmaM * kKChunk;              // [n,     kKChunk]
+    // 2xTF32 mode adds a residual buffer right after b_smem_hi (host sizes smem).
+    float* b_smem_lo = kEnable2xTF32 ? b_smem_hi + n * kKChunk : b_smem_hi;
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
@@ -285,17 +300,24 @@ __global__ void hc_prenorm_block_reduce_mma_kernel(
             a_smem[row * kKChunk + kk] = v;
         }
         // Cooperative load B[n, kc_size] → b_smem with explicit tf32 rounding.
+        // 2xTF32: also stage the residual (b_raw - b_hi rounded back to tf32).
         for (int idx = threadIdx.x; idx < n * kKChunk; idx += kMmaThreads) {
             const int col = idx / kKChunk;
             const int kk = idx - col * kKChunk;
-            float v = 0.f;
+            float v_hi = 0.f, v_lo = 0.f;
             if (col < n && kk < kc_size) {
                 const float raw =
                     b[static_cast<int64_t>(col) * b_stride_n +
                       static_cast<int64_t>(k_off + kk) * b_stride_k];
-                v = __uint_as_float(round_to_tf32_bits_dev(raw));
+                v_hi = __uint_as_float(round_to_tf32_bits_dev(raw));
+                if (kEnable2xTF32) {
+                    v_lo = __uint_as_float(round_to_tf32_bits_dev(raw - v_hi));
+                }
             }
-            b_smem[col * kKChunk + kk] = v;
+            b_smem_hi[col * kKChunk + kk] = v_hi;
+            if (kEnable2xTF32) {
+                b_smem_lo[col * kKChunk + kk] = v_lo;
+            }
         }
         __syncthreads();
 
@@ -326,10 +348,17 @@ __global__ void hc_prenorm_block_reduce_mma_kernel(
                 //   b[1] = B[tid_in_group + 4][groupID]
                 // Our smem stores B as b_smem[n][k], so col=k is contiguous:
                 const int b_n_idx = n_base + groupID;
-                const uint32_t b0 = __float_as_uint(
-                    b_smem[b_n_idx * kKChunk + kc + tid_in_group]);
-                const uint32_t b1 = __float_as_uint(
-                    b_smem[b_n_idx * kKChunk + kc + tid_in_group + 4]);
+                const uint32_t b0_hi = __float_as_uint(
+                    b_smem_hi[b_n_idx * kKChunk + kc + tid_in_group]);
+                const uint32_t b1_hi = __float_as_uint(
+                    b_smem_hi[b_n_idx * kKChunk + kc + tid_in_group + 4]);
+                uint32_t b0_lo = 0u, b1_lo = 0u;
+                if (kEnable2xTF32) {
+                    b0_lo = __float_as_uint(
+                        b_smem_lo[b_n_idx * kKChunk + kc + tid_in_group]);
+                    b1_lo = __float_as_uint(
+                        b_smem_lo[b_n_idx * kKChunk + kc + tid_in_group + 4]);
+                }
 
                 if (kScalarCheck) {
                     // Manual matmul: each lane writes the 4 output elements
@@ -339,26 +368,40 @@ __global__ void hc_prenorm_block_reduce_mma_kernel(
                     //   c_acc[1] -> D[groupID    ][2*tid_in_group + 1]
                     //   c_acc[2] -> D[groupID + 8][2*tid_in_group    ]
                     //   c_acc[3] -> D[groupID + 8][2*tid_in_group + 1]
+                    // 2xTF32 oracle: read (b_hi + b_lo) so the scalar matmul
+                    // models what the two mma.sync calls compute.
                     const int dn0 = n_base + 2 * tid_in_group;
                     const int dn1 = dn0 + 1;
                     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
                     for (int kk = 0; kk < kMmaK; ++kk) {
                         const float a_r0 = a_smem[a_row0 * kKChunk + kc + kk];
                         const float a_r1 = a_smem[a_row1 * kKChunk + kc + kk];
-                        const float b_n0 = (dn0 < n) ? b_smem[dn0 * kKChunk + kc + kk] : 0.f;
-                        const float b_n1 = (dn1 < n) ? b_smem[dn1 * kKChunk + kc + kk] : 0.f;
+                        float b_n0 = 0.f, b_n1 = 0.f;
+                        if (dn0 < n) {
+                            b_n0 = b_smem_hi[dn0 * kKChunk + kc + kk];
+                            if (kEnable2xTF32) {
+                                b_n0 += b_smem_lo[dn0 * kKChunk + kc + kk];
+                            }
+                        }
+                        if (dn1 < n) {
+                            b_n1 = b_smem_hi[dn1 * kKChunk + kc + kk];
+                            if (kEnable2xTF32) {
+                                b_n1 += b_smem_lo[dn1 * kKChunk + kc + kk];
+                            }
+                        }
                         acc0 += a_r0 * b_n0;
                         acc1 += a_r0 * b_n1;
                         acc2 += a_r1 * b_n0;
                         acc3 += a_r1 * b_n1;
                     }
                     (void)a0; (void)a1; (void)a2; (void)a3;
-                    (void)b0; (void)b1;
+                    (void)b0_hi; (void)b1_hi; (void)b0_lo; (void)b1_lo;
                     c_acc[0] += acc0;
                     c_acc[1] += acc1;
                     c_acc[2] += acc2;
                     c_acc[3] += acc3;
                 } else {
+                    // First mma: c += a * b_hi
                     asm volatile(
                         "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
                         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -366,7 +409,18 @@ __global__ void hc_prenorm_block_reduce_mma_kernel(
                         : "+f"(c_acc[0]), "+f"(c_acc[1]),
                           "+f"(c_acc[2]), "+f"(c_acc[3])
                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1));
+                          "r"(b0_hi), "r"(b1_hi));
+                    if (kEnable2xTF32) {
+                        // Second mma: c += a * b_lo (residual)
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+                            "{%0, %1, %2, %3};\n"
+                            : "+f"(c_acc[0]), "+f"(c_acc[1]),
+                              "+f"(c_acc[2]), "+f"(c_acc[3])
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                              "r"(b0_lo), "r"(b1_lo));
+                    }
                 }
             }
         }
@@ -453,37 +507,45 @@ void sm120_tf32_hc_prenorm_gemm_fallback(const torch::Tensor& a,
     const int64_t s_stride_m = num_splits == 1 ? sqr_sum.stride(0)
                                                : sqr_sum.stride(1);
 
+    // Heuristic: MMA grid is (n_blocks_m × num_splits). When that's too small
+    // to fill enough waves on the GPU, the scalar kernel (which has finer-grained
+    // m-row-per-block parallelism) wins despite no tensor cores. Threshold of
+    // 384 was picked from microbench: m=4096 sp=0 (256 blocks) regresses 0.7×
+    // vs scalar; m=8192 sp=0 (512 blocks) wins. 384 lands between, slightly
+    // biased toward safety so 2xTF32's extra ~10% cost stays in the win column.
+    constexpr int64_t kMmaMinBlocks = 384;
     if (n <= 32) {
-        if (sm120_hc_prenorm_mma_enabled() && n > 0) {
+        const int n_blocks_m = (m + sm120_fallback::kMmaM - 1) /
+                               sm120_fallback::kMmaM;
+        const int64_t mma_total_blocks =
+            static_cast<int64_t>(num_splits) *
+            static_cast<int64_t>(n_blocks_m);
+        if (sm120_hc_prenorm_mma_enabled() && n > 0
+            && mma_total_blocks >= kMmaMinBlocks) {
             using sm120_fallback::kMmaM;
             using sm120_fallback::kMmaThreads;
             using sm120_fallback::kKChunk;
-            const int n_blocks_m = (m + kMmaM - 1) / kMmaM;
-            const int64_t total_blocks =
-                static_cast<int64_t>(num_splits) *
-                static_cast<int64_t>(n_blocks_m);
-            const size_t shared_bytes =
-                static_cast<size_t>(kMmaM + n) * kKChunk * sizeof(float);
+            const int64_t total_blocks = mma_total_blocks;
             const bool scalar_check = sm120_hc_prenorm_mma_scalar_check();
-            if (scalar_check) {
-                sm120_fallback::hc_prenorm_block_reduce_mma_kernel<true><<<
-                    static_cast<unsigned>(total_blocks), kMmaThreads,
-                    shared_bytes, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
-                    b.data_ptr<float>(), d.data_ptr<float>(),
-                    sqr_sum.data_ptr<float>(), a.stride(0), a.stride(1),
-                    b.stride(0), b.stride(1), d_stride_split, d_stride_m,
-                    d_stride_n, s_stride_split, s_stride_m, m, n, k, num_splits);
-            } else {
-                sm120_fallback::hc_prenorm_block_reduce_mma_kernel<false><<<
-                    static_cast<unsigned>(total_blocks), kMmaThreads,
-                    shared_bytes, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
-                    b.data_ptr<float>(), d.data_ptr<float>(),
-                    sqr_sum.data_ptr<float>(), a.stride(0), a.stride(1),
-                    b.stride(0), b.stride(1), d_stride_split, d_stride_m,
-                    d_stride_n, s_stride_split, s_stride_m, m, n, k, num_splits);
-            }
+            const bool two_xtf32 = sm120_hc_prenorm_mma_2xtf32();
+            // 2xTF32 stages a residual B buffer alongside the hi buffer.
+            const size_t shared_bytes =
+                static_cast<size_t>(kMmaM + (two_xtf32 ? 2 : 1) * n) *
+                kKChunk * sizeof(float);
+            #define DG_HC_LAUNCH_MMA(SC, TX) \
+                sm120_fallback::hc_prenorm_block_reduce_mma_kernel<SC, TX> \
+                    <<<static_cast<unsigned>(total_blocks), kMmaThreads, \
+                       shared_bytes, stream>>>( \
+                    reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()), \
+                    b.data_ptr<float>(), d.data_ptr<float>(), \
+                    sqr_sum.data_ptr<float>(), a.stride(0), a.stride(1), \
+                    b.stride(0), b.stride(1), d_stride_split, d_stride_m, \
+                    d_stride_n, s_stride_split, s_stride_m, m, n, k, num_splits)
+            if (scalar_check && two_xtf32)        { DG_HC_LAUNCH_MMA(true,  true);  }
+            else if (scalar_check && !two_xtf32)  { DG_HC_LAUNCH_MMA(true,  false); }
+            else if (!scalar_check && two_xtf32)  { DG_HC_LAUNCH_MMA(false, true);  }
+            else                                  { DG_HC_LAUNCH_MMA(false, false); }
+            #undef DG_HC_LAUNCH_MMA
             DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
             return;
         }
