@@ -259,6 +259,36 @@ __host__ __forceinline__ bool sm120_score_qstat_vec_scalar_check() {
     return enabled;
 }
 
+// SCORE_QSTAT_VEC8 — bf16x8 (uint4 / 16-byte) load variant. When set,
+// switches the qstat_vec kernel template instantiation from kVecWidth=4
+// to kVecWidth=8: half as many LDGs, single 16-byte transaction per
+// per-thread-per-iteration K read. Default OFF; ship if microbench beats
+// vec4 and e2e A/B confirms.
+__host__ __forceinline__ bool sm120_score_qstat_vec8_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DG_SM120_SCORE_QSTAT_VEC8");
+        if (env == nullptr || env[0] == '\0') return false;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
+// OUTPUT_SSTAT_VEC — bf16x4 vec-load variant of
+// sparse_mla_workspace_output_sstat_kernel. Each thread accumulates 4
+// contiguous head_dim outputs simultaneously, issuing one LDG.E.U64 per j
+// in place of 4 single-element bf16 LDGs. Per-d FMA order is preserved
+// (each d is an independent score-FMA chain identical to scalar), so math
+// is bit-identical to the scalar kernel — no scalar_check flag needed.
+// Requires kv_stride_d == 1 and kHeadDim % 4 == 0.
+__host__ __forceinline__ bool sm120_output_sstat_vec_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DG_SM120_OUTPUT_SSTAT_VEC");
+        if (env == nullptr || env[0] == '\0') return false;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
 // FLASH_FUSION — full score+softmax+output fusion in a single kernel with
 // smem-resident K for the (b, h) tile. Loads K once into ~128 KB of dynamic
 // smem (requires cudaFuncSetAttribute(MaxDynamicSmem)), reuses it for both
@@ -1601,7 +1631,8 @@ __global__ void sparse_mla_workspace_score_tiled_qstat_kernel(
 // kScalarCheck template flag: when true, runs the scalar reduction order
 // inside this kernel for FMA-oracle parity debug. Production shape with
 // kScalarCheck=false issues the wide loads.
-template <typename q_t, typename kv_t, bool kScalarCheck = false>
+template <typename q_t, typename kv_t, bool kScalarCheck = false,
+          int kVecWidth = 4>
 __global__ void sparse_mla_workspace_score_tiled_qstat_vec_kernel(
     const q_t* __restrict__ q, const kv_t* __restrict__ kv_workspace,
     const void* __restrict__ topk_length,
@@ -1615,6 +1646,10 @@ __global__ void sparse_mla_workspace_score_tiled_qstat_vec_kernel(
                   "qstat_vec kernel assumes kScoreGroupSize == 8");
     static_assert(kHeadDim % 32 == 0,
                   "qstat_vec kernel assumes head_dim multiple of 32");
+    static_assert(kVecWidth == 4 || kVecWidth == 8,
+                  "qstat_vec kernel supports kVecWidth in {4, 8}");
+    static_assert(kHeadDim % (kScoreGroupSize * kVecWidth) == 0,
+                  "head_dim must be multiple of group_size * vec_width");
     __shared__ float q_smem[kHeadDim];
 
     const int h = blockIdx.y;
@@ -1664,7 +1699,7 @@ __global__ void sparse_mla_workspace_score_tiled_qstat_vec_kernel(
                                static_cast<int64_t>(d) * kv_stride_d);
         }
     } else {
-        constexpr int kEltsPerVec = 4;
+        constexpr int kEltsPerVec = kVecWidth;
         constexpr int kStridePerIter = kScoreGroupSize * kEltsPerVec;
         constexpr int kIters = kHeadDim / kStridePerIter;
         const int64_t kv_row_base = static_cast<int64_t>(b) * kv_stride_b +
@@ -1673,18 +1708,49 @@ __global__ void sparse_mla_workspace_score_tiled_qstat_vec_kernel(
         #pragma unroll
         for (int g = 0; g < kIters; ++g) {
             const int d_base = g * kStridePerIter + lane * kEltsPerVec;
-            const __nv_bfloat162* kv_pair_ptr =
-                reinterpret_cast<const __nv_bfloat162*>(kv_row_ptr + d_base);
-            const __nv_bfloat162 kv_pair_lo = kv_pair_ptr[0];
-            const __nv_bfloat162 kv_pair_hi = kv_pair_ptr[1];
-            const float kv0 = __bfloat162float(kv_pair_lo.x);
-            const float kv1 = __bfloat162float(kv_pair_lo.y);
-            const float kv2 = __bfloat162float(kv_pair_hi.x);
-            const float kv3 = __bfloat162float(kv_pair_hi.y);
-            partial += q_smem[d_base] * kv0;
-            partial += q_smem[d_base + 1] * kv1;
-            partial += q_smem[d_base + 2] * kv2;
-            partial += q_smem[d_base + 3] * kv3;
+            if constexpr (kEltsPerVec == 4) {
+                const __nv_bfloat162* kv_pair_ptr =
+                    reinterpret_cast<const __nv_bfloat162*>(kv_row_ptr +
+                                                            d_base);
+                const __nv_bfloat162 kv_pair_lo = kv_pair_ptr[0];
+                const __nv_bfloat162 kv_pair_hi = kv_pair_ptr[1];
+                const float kv0 = __bfloat162float(kv_pair_lo.x);
+                const float kv1 = __bfloat162float(kv_pair_lo.y);
+                const float kv2 = __bfloat162float(kv_pair_hi.x);
+                const float kv3 = __bfloat162float(kv_pair_hi.y);
+                partial += q_smem[d_base] * kv0;
+                partial += q_smem[d_base + 1] * kv1;
+                partial += q_smem[d_base + 2] * kv2;
+                partial += q_smem[d_base + 3] * kv3;
+            } else {  // kEltsPerVec == 8 — single 16-byte (uint4) load
+                const uint4* kv_quad_ptr =
+                    reinterpret_cast<const uint4*>(kv_row_ptr + d_base);
+                const uint4 kv_quad = *kv_quad_ptr;
+                const __nv_bfloat162 kv_pair0 =
+                    *reinterpret_cast<const __nv_bfloat162*>(&kv_quad.x);
+                const __nv_bfloat162 kv_pair1 =
+                    *reinterpret_cast<const __nv_bfloat162*>(&kv_quad.y);
+                const __nv_bfloat162 kv_pair2 =
+                    *reinterpret_cast<const __nv_bfloat162*>(&kv_quad.z);
+                const __nv_bfloat162 kv_pair3 =
+                    *reinterpret_cast<const __nv_bfloat162*>(&kv_quad.w);
+                const float kv0 = __bfloat162float(kv_pair0.x);
+                const float kv1 = __bfloat162float(kv_pair0.y);
+                const float kv2 = __bfloat162float(kv_pair1.x);
+                const float kv3 = __bfloat162float(kv_pair1.y);
+                const float kv4 = __bfloat162float(kv_pair2.x);
+                const float kv5 = __bfloat162float(kv_pair2.y);
+                const float kv6 = __bfloat162float(kv_pair3.x);
+                const float kv7 = __bfloat162float(kv_pair3.y);
+                partial += q_smem[d_base] * kv0;
+                partial += q_smem[d_base + 1] * kv1;
+                partial += q_smem[d_base + 2] * kv2;
+                partial += q_smem[d_base + 3] * kv3;
+                partial += q_smem[d_base + 4] * kv4;
+                partial += q_smem[d_base + 5] * kv5;
+                partial += q_smem[d_base + 6] * kv6;
+                partial += q_smem[d_base + 7] * kv7;
+            }
         }
     }
 
@@ -2259,6 +2325,109 @@ __global__ void sparse_mla_workspace_output_sstat_kernel(
                  static_cast<int64_t>(h) * out_stride_h +
                  static_cast<int64_t>(d) * out_stride_d,
         accum * gate);
+}
+
+// bf16x4 vec-load variant of sparse_mla_workspace_output_sstat_kernel.
+// Each thread owns 4 contiguous head_dim outputs (d_base..d_base+3) and
+// reads K via reinterpret_cast<__nv_bfloat162> (one LDG.E.U64 per j) instead
+// of 4 single-element bf16 LDGs. Per-d FMA chain is identical to scalar:
+// for each d in {d_base..+3}, accum_d = sum_j s_smem[j] * kv[b,j,d] —
+// bit-identical to running the scalar kernel four times. Requires
+// kv_stride_d == 1 (innermost head_dim contiguous) and kHeadDim % 4 == 0.
+template <typename kv_t, typename out_t>
+__global__ void sparse_mla_workspace_output_sstat_vec_kernel(
+    const kv_t* __restrict__ kv_workspace, const void* __restrict__ topk_length,
+    const void* __restrict__ extra_topk_length,
+    const float* __restrict__ scores, const float* __restrict__ lse,
+    const float* __restrict__ attn_sink, out_t* __restrict__ out,
+    int batch_size, int active_heads, int num_heads, int main_topk,
+    int extra_topk, int candidate_slots, int64_t kv_stride_b,
+    int64_t kv_stride_s, int64_t kv_stride_d, int64_t out_stride_b,
+    int64_t out_stride_h, int64_t out_stride_d, int topk_length_kind,
+    int extra_topk_length_kind) {
+    extern __shared__ float s_smem[];
+
+    const int bh = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int b = bh / active_heads;
+    const int h = bh - b * active_heads;
+    if (b >= batch_size) return;
+
+    const int64_t score_base =
+        (static_cast<int64_t>(b) * active_heads + h) * candidate_slots;
+    for (int s = threadIdx.x; s < candidate_slots; s += blockDim.x) {
+        s_smem[s] = scores[score_base + s];
+    }
+    __syncthreads();
+
+    const int d_base = (tile * blockDim.x + threadIdx.x) * 4;
+    if (d_base >= kHeadDim) return;
+
+    const int main_limit = max(
+        0, min(main_topk,
+               load_length_value(topk_length, topk_length_kind, b, main_topk)));
+    const int extra_limit =
+        max(0, min(extra_topk,
+                   load_length_value(extra_topk_length, extra_topk_length_kind,
+                                     b, extra_topk)));
+
+    float accum0 = 0.0f, accum1 = 0.0f, accum2 = 0.0f, accum3 = 0.0f;
+    for (int j = 0; j < main_limit; ++j) {
+        const float s = s_smem[j];
+        const int64_t kv_off = static_cast<int64_t>(b) * kv_stride_b +
+                               static_cast<int64_t>(j) * kv_stride_s +
+                               static_cast<int64_t>(d_base) * kv_stride_d;
+        const __nv_bfloat162* p2 =
+            reinterpret_cast<const __nv_bfloat162*>(kv_workspace + kv_off);
+        __nv_bfloat162 v01 = p2[0];
+        __nv_bfloat162 v23 = p2[1];
+        accum0 += s * __bfloat162float(v01.x);
+        accum1 += s * __bfloat162float(v01.y);
+        accum2 += s * __bfloat162float(v23.x);
+        accum3 += s * __bfloat162float(v23.y);
+    }
+    for (int j = 0; j < extra_limit; ++j) {
+        const int workspace_j = main_topk + j;
+        const float s = s_smem[workspace_j];
+        const int64_t kv_off =
+            static_cast<int64_t>(b) * kv_stride_b +
+            static_cast<int64_t>(workspace_j) * kv_stride_s +
+            static_cast<int64_t>(d_base) * kv_stride_d;
+        const __nv_bfloat162* p2 =
+            reinterpret_cast<const __nv_bfloat162*>(kv_workspace + kv_off);
+        __nv_bfloat162 v01 = p2[0];
+        __nv_bfloat162 v23 = p2[1];
+        accum0 += s * __bfloat162float(v01.x);
+        accum1 += s * __bfloat162float(v01.y);
+        accum2 += s * __bfloat162float(v23.x);
+        accum3 += s * __bfloat162float(v23.y);
+    }
+
+    const float row_lse = lse[static_cast<int64_t>(b) * num_heads + h];
+    const float sink = attn_sink == nullptr ? 0.0f : attn_sink[h];
+    const float gate =
+        attn_sink == nullptr ? 1.0f : 1.0f / (1.0f + expf(-(row_lse - sink)));
+    const int64_t out_bh =
+        static_cast<int64_t>(b) * out_stride_b +
+        static_cast<int64_t>(h) * out_stride_h;
+    store_out_value<out_t>(
+        out, out_bh + static_cast<int64_t>(d_base + 0) * out_stride_d,
+        accum0 * gate);
+    if (d_base + 1 < kHeadDim) {
+        store_out_value<out_t>(
+            out, out_bh + static_cast<int64_t>(d_base + 1) * out_stride_d,
+            accum1 * gate);
+    }
+    if (d_base + 2 < kHeadDim) {
+        store_out_value<out_t>(
+            out, out_bh + static_cast<int64_t>(d_base + 2) * out_stride_d,
+            accum2 * gate);
+    }
+    if (d_base + 3 < kHeadDim) {
+        store_out_value<out_t>(
+            out, out_bh + static_cast<int64_t>(d_base + 3) * out_stride_d,
+            accum3 * gate);
+    }
 }
 
 // Fused softmax + output kernel (stepping stone toward full flash-fusion).
@@ -5500,9 +5669,32 @@ void launch_sparse_mla_decode_from_workspace_split(
         if constexpr (std::is_same_v<q_t, __nv_bfloat16> &&
                       std::is_same_v<kv_t, __nv_bfloat16>) {
             const bool scalar_check = sm120_score_qstat_vec_scalar_check();
+            const bool vec8 = sm120_score_qstat_vec8_enabled() &&
+                              (kHeadDim % (kScoreGroupSize * 8) == 0) &&
+                              (reinterpret_cast<uintptr_t>(
+                                   kv_workspace.data_ptr()) %
+                                   16 ==
+                               0);
             if (scalar_check) {
                 sparse_mla_workspace_score_tiled_qstat_vec_kernel<q_t, kv_t,
-                                                                  true>
+                                                                  true, 4>
+                    <<<score_grid, kThreads, 0, stream>>>(
+                        reinterpret_cast<const q_t*>(q.data_ptr()),
+                        reinterpret_cast<const kv_t*>(kv_workspace.data_ptr()),
+                        topk_length.defined() ? topk_length.data_ptr() : nullptr,
+                        extra_topk_length.defined()
+                            ? extra_topk_length.data_ptr()
+                            : nullptr,
+                        scores.data_ptr<float>(), batch_size, active_heads,
+                        num_heads, main_topk, extra_topk, candidate_slots,
+                        q.stride(0), q.stride(2), q.stride(3),
+                        kv_workspace.stride(0), kv_workspace.stride(1),
+                        kv_workspace.stride(2), length_tensor_kind(topk_length),
+                        length_tensor_kind(extra_topk_length),
+                        static_cast<float>(softmax_scale));
+            } else if (vec8) {
+                sparse_mla_workspace_score_tiled_qstat_vec_kernel<q_t, kv_t,
+                                                                  false, 8>
                     <<<score_grid, kThreads, 0, stream>>>(
                         reinterpret_cast<const q_t*>(q.data_ptr()),
                         reinterpret_cast<const kv_t*>(kv_workspace.data_ptr()),
@@ -5519,7 +5711,7 @@ void launch_sparse_mla_decode_from_workspace_split(
                         static_cast<float>(softmax_scale));
             } else {
                 sparse_mla_workspace_score_tiled_qstat_vec_kernel<q_t, kv_t,
-                                                                  false>
+                                                                  false, 4>
                     <<<score_grid, kThreads, 0, stream>>>(
                         reinterpret_cast<const q_t*>(q.data_ptr()),
                         reinterpret_cast<const kv_t*>(kv_workspace.data_ptr()),
@@ -5629,6 +5821,33 @@ void launch_sparse_mla_decode_from_workspace_split(
                     kv_workspace.stride(0), kv_workspace.stride(1),
                     kv_workspace.stride(2), out.stride(0), out.stride(2),
                     out.stride(3));
+        }
+    } else if (fast_path && sm120_output_sstat_vec_enabled() &&
+               std::is_same_v<kv_t, __nv_bfloat16> &&
+               kv_workspace.stride(2) == 1 && (kHeadDim % 4) == 0) {
+        if constexpr (std::is_same_v<kv_t, __nv_bfloat16>) {
+            const size_t out_smem_bytes =
+                static_cast<size_t>(candidate_slots) * sizeof(float);
+            const dim3 out_vec_grid(
+                batch_size * active_heads,
+                (kHeadDim + kThreads * 4 - 1) / (kThreads * 4));
+            sparse_mla_workspace_output_sstat_vec_kernel<kv_t, out_t>
+                <<<out_vec_grid, kThreads, out_smem_bytes, stream>>>(
+                    reinterpret_cast<const kv_t*>(kv_workspace.data_ptr()),
+                    topk_length.defined() ? topk_length.data_ptr() : nullptr,
+                    extra_topk_length.defined()
+                        ? extra_topk_length.data_ptr()
+                        : nullptr,
+                    scores.data_ptr<float>(), lse.data_ptr<float>(),
+                    attn_sink.defined() ? attn_sink.data_ptr<float>()
+                                        : nullptr,
+                    reinterpret_cast<out_t*>(out.data_ptr()), batch_size,
+                    active_heads, num_heads, main_topk, extra_topk,
+                    candidate_slots, kv_workspace.stride(0),
+                    kv_workspace.stride(1), kv_workspace.stride(2),
+                    out.stride(0), out.stride(2), out.stride(3),
+                    length_tensor_kind(topk_length),
+                    length_tensor_kind(extra_topk_length));
         }
     } else if (fast_path) {
         const size_t out_smem_bytes =
